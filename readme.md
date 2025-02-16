@@ -1,4 +1,4 @@
-This is an attempt to create a extrapolating mixture of experts transformer that uses recurrent blocks
+This is an attempt to create a extrapolating autoregressive decoder only mixture of experts transformer that uses recurrent blocks, with rotary postional embeddings, And post layer normalization
 
 
 [Scaling up Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach](https://arxiv.org/abs/2502.05171)
