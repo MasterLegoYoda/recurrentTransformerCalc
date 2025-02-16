@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 from torch.utils.data import DataLoader, TensorDataset
+from torch.nn.utils.rnn import pad_sequence
 
 # --- Model Definition (from recall_transformer_moe.py) ---
 class RotaryPositionalEmbeddings(nn.Module):
@@ -413,11 +414,14 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
         values = []
         rewards = []
         masks = []
+        states = [] # Initialize states list here
 
         for step in range(max_len):
+            # Record current state (make a copy so changes later won’t affect it)
+            states.append(current_seq_tokens.clone())
+
             with torch.no_grad():
                 logits, value = model(current_seq_tokens)
-                # Only use the logits corresponding to the last token for sampling
                 logits = logits[:, -1, :]
                 probs = F.softmax(logits, dim=-1)
                 dist = Categorical(probs)
@@ -426,8 +430,7 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
 
                 actions.append(action)
                 log_probs.append(log_prob)
-                # Here we only take the value of the last token
-                values.append(value[:, -1])
+                values.append(value[:, -1]) # Corrected value appending
 
                 next_token_id = action.item()
                 if next_token_id == eos_token_id:
@@ -440,8 +443,8 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
                     masks.append(1)
                     rewards.append(0.0)
                     current_seq_tokens = torch.cat([current_seq_tokens, action.unsqueeze(0)], dim=1)
-        else:
-            masks[-1] = 0
+        else: # Handle case where loop didn't break (reached max_len)
+            masks[-1] = 0 # Force termination at max_len
             rewards[-1] = calculate_reward(current_seq_tokens, None, target_result, tokenizer, vocab)
             total_reward += rewards[-1]
 
@@ -451,7 +454,7 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
 
         # Fix delta computation
         next_values = torch.zeros_like(values_tensor)
-        next_values[:-1] = values_tensor[1:]  # Shift next values
+        next_values[:-1] = values_tensor[1:] # Shift next values
         delta_t = rewards_tensor + gamma * masks_tensor * next_values - values_tensor
 
         # Compute advantages using GAE
@@ -463,6 +466,7 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
         advantages = torch.tensor(advantages, dtype=torch.float32, device=device).unsqueeze(1)
 
         trajectory = {
+            'states': states, # Add states to trajectory
             'input_sequences': input_seq_tokens,
             'actions': torch.stack(actions).to(device),
             'log_probs': torch.stack(log_probs).to(device),
@@ -481,43 +485,44 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
             model.train()
             optimizer.zero_grad()
 
-            # Forward pass (current policy)
-            input_seq = torch.tensor([trajectory['input_sequences']], device=device)
-            logits, values = model(input_seq)
-            
-            # Process action sequence
-            action_len = len(trajectory['actions'])
-            logits = logits[0, :action_len, :]
-            values = values[0, :action_len].unsqueeze(1)
+            from torch.nn.utils.rnn import pad_sequence
 
-            # Compute new log probs and entropy
-            dist = Categorical(F.softmax(logits, dim=-1))
+            # Convert the list of state tensors (each of shape [1, seq_len_i]) into a padded batch.
+            # Remove the batch dimension (since each state already has one) and pad.
+            states_list = [s.squeeze(0) for s in trajectory['states']]
+            states_batch = pad_sequence(states_list, batch_first=True, padding_value=tokenizer.token_to_id['EoS']).to(device)
+
+            # Run the model on each state.
+            # Note that states_batch now has shape [num_steps, max_state_len].
+            logits, values_new = model(states_batch)
+            # For each state, we only need the output for its last non-padded token.
+            last_indices = torch.tensor([len(s) - 1 for s in states_list], device=device)
+            # Gather logits corresponding to each state's last token.
+            logits_last = logits[torch.arange(len(last_indices)), last_indices, :]
+            values_last = values_new[torch.arange(len(last_indices)), last_indices].unsqueeze(1)
+
+            # Now compute new log probabilities for the stored actions.
+            dist = Categorical(F.softmax(logits_last, dim=-1))
             new_log_probs = dist.log_prob(trajectory['actions'])
-            entropy = dist.entropy().mean()
 
-            # Compute ratios
+            # Continue with PPO loss computations:
             ratios = torch.exp(new_log_probs - trajectory['log_probs'])
-
-            # PPO loss components
             surr1 = ratios * trajectory['advantages']
             surr2 = torch.clamp(ratios, 1-clip_param, 1+clip_param) * trajectory['advantages']
             policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = F.mse_loss(values, trajectory['returns'])
-            
-            # MOE auxiliary loss
+            value_loss = F.mse_loss(values_last, trajectory['returns'])
+            entropy = dist.entropy().mean()
+
+            # Add any additional auxiliary losses (e.g., from MOE) as before
             moe_loss = sum(module.auxiliary_loss() for module in model.modules() if isinstance(module, DYNMOELayer))
-            
-            # Total loss
-            total_loss = (policy_loss 
-                        + value_loss_coef * value_loss 
-                        - entropy_coef * entropy 
-                        + moe_aux_loss_coef * moe_loss)
-            
+            total_loss = (policy_loss
+                          + value_loss_coef * value_loss
+                          - entropy_coef * entropy
+                          + moe_aux_loss_coef * moe_loss)
             total_loss.backward()
             optimizer.step()
 
-    return avg_reward
-
+    return avg_reward   
 # --- Main Training and Inference (in notebook) ---
 # Hyperparameters
 vocab_chars = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '-', '*', '/', '(', ')', '=', 'EoS']
