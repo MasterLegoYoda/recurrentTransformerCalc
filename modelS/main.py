@@ -324,7 +324,7 @@ class RecallTransformerWithMoE(nn.Module):
         for _ in range(num_iters):
             phi = self.recurrent_block(phi, x_emb)
         logits = self.output_head(phi)
-        value = self.value_head(phi.mean(dim=1)).squeeze(-1)  # Value is a scalar per batch item
+        value = self.value_head(phi).squeeze(-1)  # Value is a scalar per batch item
         return logits, value
 
     def generate(self, input_ids, max_length=20, temperature=1.0, num_iters=None):
@@ -417,95 +417,106 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
         for step in range(max_len):
             with torch.no_grad():
                 logits, value = model(current_seq_tokens)
+                # Only use the logits corresponding to the last token for sampling
                 logits = logits[:, -1, :]
                 probs = F.softmax(logits, dim=-1)
                 dist = Categorical(probs)
                 action = dist.sample()
                 log_prob = dist.log_prob(action)
 
-            actions.append(action)
-            log_probs.append(log_prob)
-            values.append(value)
+                actions.append(action)
+                log_probs.append(log_prob)
+                # Here we only take the value of the last token
+                values.append(value[:, -1])
 
-            next_token_id = action.item()
-            if next_token_id == eos_token_id:
-                masks.append(0)
-                current_reward = calculate_reward(current_seq_tokens, action, target_result, tokenizer, vocab)
-                rewards.append(current_reward)
-                total_reward += current_reward
-                break
-            else:
-                masks.append(1)
-                rewards.append(0.0)
-                current_seq_tokens = torch.cat([current_seq_tokens, action.unsqueeze(0)], dim=1)
+                next_token_id = action.item()
+                if next_token_id == eos_token_id:
+                    masks.append(0)
+                    current_reward = calculate_reward(current_seq_tokens, action, target_result, tokenizer, vocab)
+                    rewards.append(current_reward)
+                    total_reward += current_reward
+                    break
+                else:
+                    masks.append(1)
+                    rewards.append(0.0)
+                    current_seq_tokens = torch.cat([current_seq_tokens, action.unsqueeze(0)], dim=1)
+        else:
+            masks[-1] = 0
+            rewards[-1] = calculate_reward(current_seq_tokens, None, target_result, tokenizer, vocab)
+            total_reward += rewards[-1]
 
-        R = torch.tensor([0.0]).to(next(model.parameters()).device)
-        returns = []
+        values_tensor = torch.stack(values).squeeze(-1).to(device)
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
+        masks_tensor = torch.tensor(masks, dtype=torch.float32, device=device)
+
+        # Fix delta computation
+        next_values = torch.zeros_like(values_tensor)
+        next_values[:-1] = values_tensor[1:]  # Shift next values
+        delta_t = rewards_tensor + gamma * masks_tensor * next_values - values_tensor
+
+        # Compute advantages using GAE
+        advantage_buffer = 0
         advantages = []
-        for i in reversed(range(len(rewards))):
-            R = rewards[i] + gamma * R * masks[i]
-            returns.insert(0, R)
-        returns = torch.tensor(returns).to(next(model.parameters()).device).unsqueeze(1)
-        values_tensor = torch.stack(values).to(next(model.parameters()).device)
-
-        delta_t = torch.tensor(rewards).to(next(model.parameters()).device).unsqueeze(1) + gamma * values_tensor[1:] * torch.tensor(masks[:-1]).to(next(model.parameters()).device).unsqueeze(1) - values_tensor[:-1]
-        advantage_buffer = torch.zeros_like(values_tensor[0]).unsqueeze(1)
-        for i in reversed(range(len(rewards))):
-            advantage_buffer = gamma * gae_lambda * masks[i] * advantage_buffer + delta_t[i]
+        for delta, mask in zip(reversed(delta_t.tolist()), reversed(masks)):
+            advantage_buffer = delta + gamma * gae_lambda * mask * advantage_buffer
             advantages.insert(0, advantage_buffer)
-        advantages = torch.stack(advantages).to(next(model.parameters()).device)
+        advantages = torch.tensor(advantages, dtype=torch.float32, device=device).unsqueeze(1)
 
         trajectory = {
             'input_sequences': input_seq_tokens,
-            'actions': torch.stack(actions).to(next(model.parameters()).device),
-            'log_probs': torch.stack(log_probs).to(next(model.parameters()).device),
-            'values': values_tensor,
+            'actions': torch.stack(actions).to(device),
+            'log_probs': torch.stack(log_probs).to(device),
+            'values': values_tensor.unsqueeze(1),
             'advantages': advantages,
-            'returns': returns
+            'returns': (advantages + values_tensor.unsqueeze(1)).detach()
         }
         trajectories.append(trajectory)
 
     avg_reward = total_reward / len(dataset)
     print(f"Average reward for this iteration: {avg_reward:.4f}")
 
+    # Simplified PPO update loop
     for _ in range(ppo_epochs):
         for trajectory in trajectories:
             model.train()
-
-            old_log_probs = trajectory['log_probs'].detach()
-            advantages = trajectory['advantages'].detach()
-            returns = trajectory['returns'].detach()
-            actions = trajectory['actions']
-            input_sequences_batch = torch.tensor([trajectory['input_sequences']]).to(next(model.parameters()).device)
-
             optimizer.zero_grad()
-            new_logits, new_values = model(input_sequences_batch)
-            new_logits = new_logits[:, :-1, :]
-            new_values = new_values[:len(actions)]
 
-            dist_new = Categorical(F.softmax(new_logits.squeeze(0), dim=-1))
-            new_log_probs = dist_new.log_prob(actions)
+            # Forward pass (current policy)
+            input_seq = torch.tensor([trajectory['input_sequences']], device=device)
+            logits, values = model(input_seq)
+            
+            # Process action sequence
+            action_len = len(trajectory['actions'])
+            logits = logits[0, :action_len, :]
+            values = values[0, :action_len].unsqueeze(1)
 
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            clip_adv = torch.clamp(ratio, 1-clip_param, 1+clip_param) * advantages
-            policy_loss = -torch.min(ratio * advantages, clip_adv).mean()
+            # Compute new log probs and entropy
+            dist = Categorical(F.softmax(logits, dim=-1))
+            new_log_probs = dist.log_prob(trajectory['actions'])
+            entropy = dist.entropy().mean()
 
-            value_loss = F.mse_loss(new_values.squeeze(-1), returns.squeeze(-1))
-            entropy = dist_new.entropy().mean()
+            # Compute ratios
+            ratios = torch.exp(new_log_probs - trajectory['log_probs'])
 
-            moe_loss = 0.0
-            for name, module in model.named_modules():
-                if isinstance(module, DYNMOELayer):
-                    moe_loss += module.auxiliary_loss()
-
-            total_loss = policy_loss + value_loss_coef * value_loss - entropy_coef * entropy + moe_aux_loss_coef * moe_loss
-
+            # PPO loss components
+            surr1 = ratios * trajectory['advantages']
+            surr2 = torch.clamp(ratios, 1-clip_param, 1+clip_param) * trajectory['advantages']
+            policy_loss = -torch.min(surr1, surr2).mean()
+            value_loss = F.mse_loss(values, trajectory['returns'])
+            
+            # MOE auxiliary loss
+            moe_loss = sum(module.auxiliary_loss() for module in model.modules() if isinstance(module, DYNMOELayer))
+            
+            # Total loss
+            total_loss = (policy_loss 
+                        + value_loss_coef * value_loss 
+                        - entropy_coef * entropy 
+                        + moe_aux_loss_coef * moe_loss)
+            
             total_loss.backward()
             optimizer.step()
-            model.eval()
 
     return avg_reward
-
 
 # --- Main Training and Inference (in notebook) ---
 # Hyperparameters
