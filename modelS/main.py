@@ -45,6 +45,60 @@ class RotaryPositionalEmbeddings(nn.Module):
         return (x * cos) + (self._rotate_half(x) * sin)
 
 
+class DenseTransformerLayer(nn.Module):
+    """Dense Transformer Layer with RoPE (no MoE)"""
+    def __init__(self, input_dim, num_heads):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = input_dim // num_heads
+        
+        # Self-attention components
+        self.q_proj = nn.Linear(input_dim, input_dim)
+        self.k_proj = nn.Linear(input_dim, input_dim)
+        self.v_proj = nn.Linear(input_dim, input_dim)
+        self.rope = RotaryPositionalEmbeddings(self.head_dim)
+        self.out_proj = nn.Linear(input_dim, input_dim)
+        
+        # FFN components
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim, 4 * input_dim),
+            nn.GELU(),
+            nn.Linear(4 * input_dim, input_dim)
+        )
+        
+        # Normalization
+        self.norm1 = nn.LayerNorm(input_dim)
+        self.norm2 = nn.LayerNorm(input_dim)
+
+    def forward(self, x):
+        # Self-attention
+        b, s, d = x.shape
+        q = self.q_proj(x).view(b, s, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(b, s, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(b, s, self.num_heads, self.head_dim)
+        
+        q = self.rope(q)
+        k = self.rope(k)
+        
+        # Attention computation
+        attn_output = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            is_causal=True
+        ).transpose(1, 2).reshape(b, s, d)
+        
+        attn_output = self.out_proj(attn_output)
+        x = self.norm1(x + attn_output)
+        
+        # FFN
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + ffn_output)
+        return x
+
+
+
+
 class DYNMOELayer(nn.Module):
     """Dynamic Mixture of Experts (DYNMOE) layer."""
     def __init__(self, input_dim, expert_dim, max_experts=16):
@@ -305,39 +359,67 @@ class RecurrentBlockWithMoE(nn.Module):
         return combined
 
 class RecallTransformerWithMoE(nn.Module):
-    """Recall Transformer Model with MoE."""
-    def __init__(self, num_layers, input_dim, vocab_size, expert_dim=64, num_heads=4, max_experts=4, max_iters=4):
+    """Modified with configurable pre/post dense layers"""
+    def __init__(self, num_layers, input_dim, vocab_size, expert_dim=64,
+                 num_heads=4, max_experts=4, max_iters=4,
+                 num_pre_layers=2, num_post_layers=2):  # New hyperparams
         super().__init__()
         self.encoder = nn.Embedding(vocab_size, input_dim)
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, input_dim),
-            nn.ReLU()
+
+        # Pre-recurrent dense layers
+        self.pre_layers = nn.ModuleList([
+            DenseTransformerLayer(input_dim, num_heads)
+            for _ in range(num_pre_layers)
+        ])
+
+        # Recurrent block
+        self.recurrent_block = RecurrentBlockWithMoE(
+            input_dim, expert_dim, max_experts, num_heads, num_layers
         )
-        self.recurrent_block = RecurrentBlockWithMoE(input_dim, expert_dim, max_experts, num_heads, num_layers=3)
         self.max_iters = max_iters
+
+        # Post-recurrent dense layers
+        self.post_layers = nn.ModuleList([
+            DenseTransformerLayer(input_dim, num_heads)
+            for _ in range(num_post_layers)
+        ])
+
+        # Output heads
         self.output_head = nn.Linear(input_dim, vocab_size)
-        self.value_head = nn.Linear(input_dim, 1)  # Value head for RL
+        self.value_head = nn.Linear(input_dim, 1)
 
     def forward(self, input_ids, num_iters=None):
         x_emb = self.encoder(input_ids)
-        phi = self.input_proj(x_emb)
+
+        # Process through pre-layers
+        for layer in self.pre_layers:
+            x_emb = layer(x_emb)
+
+        phi = x_emb
         num_iters = num_iters if num_iters is not None else self.max_iters
+
+        # Recurrent processing
         for _ in range(num_iters):
             phi = self.recurrent_block(phi, x_emb)
+
+        # Process through post-layers
+        for layer in self.post_layers:
+            phi = layer(phi)
+
         logits = self.output_head(phi)
-        value = self.value_head(phi).squeeze(-1)  # Value is a scalar per batch item
+        value = self.value_head(phi).squeeze(-1)
         return logits, value
 
     def generate(self, input_ids, max_length=20, temperature=1.0, num_iters=None):
         """Autoregressively generates tokens."""
         generated_tokens = input_ids
         for _ in range(max_length):
-            logits, _ = self.forward(generated_tokens, num_iters=num_iters)
-            next_token_logits = logits[:, -1, :] / temperature  # Use logits of the last token
+            logits, _= self.forward(generated_tokens, num_iters=num_iters)
+            next_token_logits = logits[:, -1, :] / temperature # Use logits of the last token
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             generated_tokens = torch.cat([generated_tokens, next_token], dim=-1)
-            if next_token.item() == self.encoder.num_embeddings - 1:  # Assuming last token ID is EOS
+            if next_token.item() == self.encoder.num_embeddings - 1: # Assuming last token ID is EOS
                 break
         return generated_tokens
 
@@ -523,6 +605,37 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
             optimizer.step()
 
     return avg_reward   
+
+def evaluate_model(model, difficulty_level, num_samples=100):
+    model.eval()
+    total_reward = 0.0
+    eval_data = generate_expressions(num_samples, difficulty_level)
+    
+    for problem, target in eval_data:
+        input_seq = problem + "="
+        input_tokens = tokenizer.encode(input_seq)
+        input_tensor = torch.tensor([input_tokens], dtype=torch.long).to(device)
+        
+        with torch.no_grad():
+            generated = model.generate(input_tensor, max_length=20)
+            
+        generated_tokens = generated[0].tolist()
+        generated_expr = tokenizer.decode(generated_tokens).split('EoS')[0]
+        full_expr = problem + "=" + generated_expr
+        
+        try:
+            result = eval(full_expr)
+            reward = 1.0 if abs(result - target) < 1e-6 else 0.0
+        except:
+            reward = 0.0
+            
+        total_reward += reward
+    
+    avg_reward = total_reward / num_samples
+    model.train()
+    return avg_reward
+
+
 # --- Main Training and Inference (in notebook) ---
 # Hyperparameters
 vocab_chars = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '-', '*', '/', '(', ')', '=', 'EoS']
@@ -530,29 +643,38 @@ vocab = vocab_chars
 vocab_size = len(vocab)
 tokenizer = ExpressionTokenizer(vocab)
 
-input_dim = 64
-expert_dim = 32
-max_experts = 4
-max_iters = 4
-num_layers = 2
-num_heads = 2
+input_dim = 512
+expert_dim = 192
+max_experts = 6
+max_iters = 6
+num_layers = 4
+num_heads = 8
 learning_rate = 1e-4
 ppo_epochs = 4
 batch_size_ppo = 32
 initial_difficulty = 1
 difficulty_increment_interval = 50
 difficulty_increment_amount = 0.5
+num_pre_layers = 3
+num_post_layers = 2
+initial_difficulty = 1  # Start with 1 operation
+difficulty_increment_amount = 0.5  # Increment by 1 operation
+max_difficulty = 5
+evaluation_interval = 5  # Evaluate every 10 iterations
+success_threshold = 0.95  # 95% accuracy to advance
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model = RecallTransformerWithMoE(
-    num_layers=num_layers,
+    num_layers=3,
     input_dim=input_dim,
     vocab_size=vocab_size,
     expert_dim=expert_dim,
     num_heads=num_heads,
     max_experts=max_experts,
-    max_iters=max_iters
+    max_iters=max_iters,
+    num_pre_layers=num_pre_layers,    # Pass new params
+    num_post_layers=num_post_layers
 ).to(device)
 
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -561,24 +683,35 @@ num_iterations = 500
 current_difficulty = initial_difficulty
 
 for iteration in range(num_iterations):
-    num_expressions_per_iter = batch_size_ppo
-    expressions_data = generate_expressions(num_expressions_per_iter, int(current_difficulty))
+    # Generate training data at current difficulty
+    expressions_data = generate_expressions(batch_size_ppo, current_difficulty)
     dataset_rl = expressions_data
-
-    avg_reward = ppo_iteration(model, optimizer, ppo_epochs, batch_size_ppo, dataset_rl, tokenizer, vocab)
-    print(f"Iteration {iteration+1}/{num_iterations}, Difficulty: {current_difficulty:.2f}, Avg Reward: {avg_reward:.4f}")
-
+    
+    # Run PPO iteration
+    avg_reward = ppo_iteration(
+        model, optimizer, ppo_epochs, batch_size_ppo, 
+        dataset_rl, tokenizer, vocab
+    )
+    
+    # Adapt MoE experts
     for name, module in model.named_modules():
         if isinstance(module, DYNMOELayer):
             module.adapt_experts(iteration, adapt_interval=10)
-
-    if (iteration + 1) % difficulty_increment_interval == 0:
-        current_difficulty += difficulty_increment_amount
-        current_difficulty = min(current_difficulty, 5)
-
-    if (iteration + 1) % 20 == 0:
-        print(f"--- Iteration {iteration+1} Evaluation ---")
-        pass # Add evaluation loop here
+    
+    # Evaluate and adjust difficulty
+    if (iteration + 1) % evaluation_interval == 0:
+        eval_reward = evaluate_model(model, current_difficulty)
+        print(f"Iteration {iteration+1} - Current Difficulty: {current_difficulty}")
+        print(f"Evaluation Reward: {eval_reward:.4f}")
+        
+        if eval_reward >= success_threshold:
+            if current_difficulty < max_difficulty:
+                current_difficulty += difficulty_increment_amount
+                print(f"Mastered! New Difficulty: {current_difficulty}")
+            else:
+                print("Reached maximum difficulty")
+        else:
+            print(f"Not mastered - Continuing at difficulty {current_difficulty}")
 
 print("Training complete!")
 
