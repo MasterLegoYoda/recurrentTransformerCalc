@@ -98,7 +98,6 @@ class DenseTransformerLayer(nn.Module):
 
 
 
-
 class DYNMOELayer(nn.Module):
     """Dynamic Mixture of Experts (DYNMOE) layer."""
     def __init__(self, input_dim, expert_dim, max_experts=16):
@@ -133,24 +132,40 @@ class DYNMOELayer(nn.Module):
 
     def forward(self, x):
         batch_size, seq_len, d = x.shape
-        x_flat = x.reshape(-1, d)
+        x_flat = x.reshape(-1, d) # Flatten for batched processing
         active_indices = torch.where(self.active_experts)[0]
         Wg_active = self.Wg[active_indices]
         G_active = self.G[active_indices]
         num_active = len(active_indices)
+
         if num_active == 0:
             return x
+
         x_norm = F.normalize(x_flat, p=2, dim=-1)
         Wg_norm = F.normalize(Wg_active, p=2, dim=-1)
-        similarities = torch.einsum('bd,ed->be', x_norm, Wg_norm)
+        similarities = torch.einsum('bd,ed->be', x_norm, Wg_norm) # Batch similarity computation
         scores = torch.sigmoid(similarities)
         gates = (scores > torch.sigmoid(G_active)).float()
-        gates = gates + (scores - scores.detach())
-        outputs = []
-        for i, idx in enumerate(active_indices.tolist()):
-            expert_out = self.experts[idx](x_flat) * gates[:, i].unsqueeze(-1)
-            outputs.append(expert_out)
-        combined = sum(outputs)
+        gates = gates + (scores - scores.detach()) # Add back gradient for routing
+
+        # Batched expert computation
+        active_experts_list = [self.experts[i] for i in active_indices.tolist()]
+
+        # Prepare weights and biases for batched computation
+        w1 = torch.stack([e[0].weight for e in active_experts_list], dim=0)  # (K, d_in, d_exp)
+        b1 = torch.stack([e[0].bias for e in active_experts_list], dim=0)    # (K, d_exp)
+        w2 = torch.stack([e[2].weight for e in active_experts_list], dim=0)  # (K, d_exp, d_in)
+        b2 = torch.stack([e[2].bias for e in active_experts_list], dim=0)    # (K, d_in)
+
+        # Batched computation across experts
+        x_exp = x_flat.unsqueeze(1)  # (B*S, 1, d_in), reshape for batched matmul
+        h = torch.bmm(x_exp, w1.to(x_exp.dtype).transpose(1,2)) + b1.to(x_exp.dtype).unsqueeze(0)  # (B*S, K, d_exp) - Batched linear 1
+        h = F.gelu(h)
+        expert_outputs = torch.bmm(h, w2.to(h.dtype).transpose(1,2)) + b2.to(h.dtype).unsqueeze(0)  # (B*S, K, d_in) - Batched linear 2
+
+        # Weight expert outputs by gates and sum
+        combined = (expert_outputs * gates.unsqueeze(-1).unsqueeze(-1)).sum(dim=1) # (B*S, d_in)
+
         k = gates.sum(dim=-1)
         scale = torch.where(k > 0, 1/(k + 1e-12), 1.0).unsqueeze(-1)
         output = combined * scale
@@ -158,112 +173,18 @@ class DYNMOELayer(nn.Module):
         if torch.any(zero_mask):
             top1_gate = torch.zeros_like(gates)
             top1_gate[torch.arange(gates.size(0)), scores.argmax(dim=-1)] = 1.0
-            outputs = [self.experts[idx](x_flat) * top1_gate[:, i].unsqueeze(-1)
-                      for i, idx in enumerate(active_indices)]
-            output[zero_mask] = sum(outputs)[zero_mask]
+            expert_outputs_zero_mask = [] # Compute outputs only for zero-mask indices based on top-1 gate
+            for i, idx in enumerate(active_indices.tolist()):
+                expert_out_zm = self.experts[idx](x_flat[zero_mask]) * top1_gate[zero_mask, i].unsqueeze(-1)
+                expert_outputs_zero_mask.append(expert_out_zm)
+            output_zm = sum(expert_outputs_zero_mask)
+            output[zero_mask] = output_zm # Assign outputs for zero-mask indices
+
         if self.training:
             self.RE[active_indices] += gates.sum(dim=0).detach().to(torch.int)
             if zero_mask.any():
                 self.RS += x_flat[zero_mask].sum(dim=0).detach()
-        return output.reshape(batch_size, seq_len, d)
 
-    def auxiliary_loss(self):
-        active_Wg = self.Wg[self.active_experts]
-        if len(active_Wg) == 0:
-            return torch.tensor(0.0, device=self.Wg.device)
-        active_Wg_norm = F.normalize(active_Wg, p=2, dim=1)
-        identity = torch.eye(len(active_Wg), device=active_Wg.device)
-        div_loss = torch.norm(active_Wg_norm @ active_Wg_norm.T - identity) ** 2
-        simp_loss = torch.sum(active_Wg ** 2)
-        return div_loss + simp_loss
-
-    def adapt_experts(self, step, adapt_interval=100):
-        if not self.training or step % adapt_interval != 0:
-            return
-        active_indices = torch.where(self.active_experts)[0]
-        if self.num_active < self.max_experts and self.RS.norm() > 1e-6:
-            inact_indices = torch.where(~self.active_experts)[0]
-            new_idx = inact_indices[0]
-            ws_new = self.RS / self.RS.norm()
-            self.Wg.data[new_idx] = ws_new
-            self.G.data[new_idx] = 0.0
-            self.active_experts[new_idx] = True
-            self.num_active += 1
-            self.RS.zero_()
-        usage = self.RE[active_indices]
-        dead_experts = (usage == 0)
-        if dead_experts.any():
-            dead_indices = active_indices[dead_experts]
-            self.active_experts[dead_indices] = False
-            self.num_active -= len(dead_indices)
-        self.RE.zero_()
-
-
-    """Dynamic Mixture of Experts (DYNMOE) layer."""
-    def __init__(self, input_dim, expert_dim, max_experts=16):
-        super().__init__()
-        self.input_dim = input_dim
-        self.expert_dim = expert_dim
-        self.max_experts = max_experts
-        self.Wg = nn.Parameter(torch.Tensor(max_experts, input_dim))
-        self.G = nn.Parameter(torch.Tensor(max_experts))
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(input_dim, expert_dim),
-                nn.GELU(),
-                nn.Linear(expert_dim, input_dim)
-            ) for _ in range(max_experts)
-        ])
-        self.register_buffer('active_experts', torch.zeros(max_experts, dtype=torch.bool))
-        self.active_experts[0] = True
-        self.num_active = 1
-        self.register_buffer('RE', torch.zeros(max_experts, dtype=torch.int))
-        self.register_buffer('RS', torch.zeros(input_dim))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.orthogonal_(self.Wg)
-        nn.init.zeros_(self.G)
-        for expert in self.experts:
-            for layer in expert:
-                if isinstance(layer, nn.Linear):
-                    nn.init.normal_(layer.weight, std=0.02)
-                    nn.init.zeros_(layer.bias)
-
-    def forward(self, x):
-        batch_size, seq_len, d = x.shape
-        x_flat = x.reshape(-1, d)
-        active_indices = torch.where(self.active_experts)[0]
-        Wg_active = self.Wg[active_indices]
-        G_active = self.G[active_indices]
-        num_active = len(active_indices)
-        if num_active == 0:
-            return x
-        x_norm = F.normalize(x_flat, p=2, dim=-1)
-        Wg_norm = F.normalize(Wg_active, p=2, dim=-1)
-        similarities = torch.einsum('bd,ed->be', x_norm, Wg_norm)
-        scores = torch.sigmoid(similarities)
-        gates = (scores > torch.sigmoid(G_active)).float()
-        gates = gates + (scores - scores.detach())
-        outputs = []
-        for i, idx in enumerate(active_indices.tolist()):
-            expert_out = self.experts[idx](x_flat) * gates[:, i].unsqueeze(-1)
-            outputs.append(expert_out)
-        combined = sum(outputs)
-        k = gates.sum(dim=-1)
-        scale = torch.where(k > 0, 1/(k + 1e-12), 1.0).unsqueeze(-1)
-        output = combined * scale
-        zero_mask = (k == 0)
-        if torch.any(zero_mask):
-            top1_gate = torch.zeros_like(gates)
-            top1_gate[torch.arange(gates.size(0)), scores.argmax(dim=-1)] = 1.0
-            outputs = [self.experts[idx](x_flat) * top1_gate[:, i].unsqueeze(-1)
-                       for i, idx in enumerate(active_indices)]
-            output[zero_mask] = sum(outputs)[zero_mask]
-        if self.training:
-            self.RE[active_indices] += gates.sum(dim=0).detach().to(torch.int)
-            if zero_mask.any():
-                self.RS += x_flat[zero_mask].sum(dim=0).detach()
         return output.reshape(batch_size, seq_len, d)
 
     def auxiliary_loss(self):
@@ -479,7 +400,7 @@ def calculate_reward(current_seq_tokens, last_action_token, target_result, token
         return 0.0
 
 # --- PPO Iteration (in notebook) ---
-def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, vocab, gamma=0.99, gae_lambda=0.95, clip_param=0.2, value_loss_coef=0.5, entropy_coef=0.01, moe_aux_loss_coef=0.01):
+def ppo_iteration(model, optimizer, scaler, ppo_epochs, batch_size, dataset, tokenizer, vocab, gamma=0.99, gae_lambda=0.95, clip_param=0.2, value_loss_coef=0.5, entropy_coef=0.01, moe_aux_loss_coef=0.01):
     trajectories = []
     total_reward = 0
 
@@ -496,37 +417,37 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
         values = []
         rewards = []
         masks = []
-        states = [] # Initialize states list here
+        states = []
 
         for step in range(max_len):
-            # Record current state (make a copy so changes later won’t affect it)
             states.append(current_seq_tokens.clone())
 
             with torch.no_grad():
-                logits, value = model(current_seq_tokens)
+                with torch.cuda.amp.autocast(): # FP16 context for forward pass
+                    logits, value = model(current_seq_tokens)
                 logits = logits[:, -1, :]
                 probs = F.softmax(logits, dim=-1)
                 dist = Categorical(probs)
                 action = dist.sample()
                 log_prob = dist.log_prob(action)
 
-                actions.append(action)
-                log_probs.append(log_prob)
-                values.append(value[:, -1]) # Corrected value appending
+            actions.append(action)
+            log_probs.append(log_prob)
+            values.append(value[:, -1])
 
-                next_token_id = action.item()
-                if next_token_id == eos_token_id:
-                    masks.append(0)
-                    current_reward = calculate_reward(current_seq_tokens, action, target_result, tokenizer, vocab)
-                    rewards.append(current_reward)
-                    total_reward += current_reward
-                    break
-                else:
-                    masks.append(1)
-                    rewards.append(0.0)
-                    current_seq_tokens = torch.cat([current_seq_tokens, action.unsqueeze(0)], dim=1)
-        else: # Handle case where loop didn't break (reached max_len)
-            masks[-1] = 0 # Force termination at max_len
+            next_token_id = action.item()
+            if next_token_id == eos_token_id:
+                masks.append(0)
+                current_reward = calculate_reward(current_seq_tokens, action, target_result, tokenizer, vocab)
+                rewards.append(current_reward)
+                total_reward += current_reward
+                break
+            else:
+                masks.append(1)
+                rewards.append(0.0)
+                current_seq_tokens = torch.cat([current_seq_tokens, action.unsqueeze(0)], dim=1)
+        else:
+            masks[-1] = 0
             rewards[-1] = calculate_reward(current_seq_tokens, None, target_result, tokenizer, vocab)
             total_reward += rewards[-1]
 
@@ -534,12 +455,10 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
         masks_tensor = torch.tensor(masks, dtype=torch.float32, device=device)
 
-        # Fix delta computation
         next_values = torch.zeros_like(values_tensor)
-        next_values[:-1] = values_tensor[1:] # Shift next values
+        next_values[:-1] = values_tensor[1:]
         delta_t = rewards_tensor + gamma * masks_tensor * next_values - values_tensor
 
-        # Compute advantages using GAE
         advantage_buffer = 0
         advantages = []
         for delta, mask in zip(reversed(delta_t.tolist()), reversed(masks)):
@@ -548,7 +467,7 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
         advantages = torch.tensor(advantages, dtype=torch.float32, device=device).unsqueeze(1)
 
         trajectory = {
-            'states': states, # Add states to trajectory
+            'states': states,
             'input_sequences': input_seq_tokens,
             'actions': torch.stack(actions).to(device),
             'log_probs': torch.stack(log_probs).to(device),
@@ -561,50 +480,44 @@ def ppo_iteration(model, optimizer, ppo_epochs, batch_size, dataset, tokenizer, 
     avg_reward = total_reward / len(dataset)
     print(f"Average reward for this iteration: {avg_reward:.4f}")
 
-    # Simplified PPO update loop
     for _ in range(ppo_epochs):
         for trajectory in trajectories:
             model.train()
             optimizer.zero_grad()
 
-            from torch.nn.utils.rnn import pad_sequence
-
-            # Convert the list of state tensors (each of shape [1, seq_len_i]) into a padded batch.
-            # Remove the batch dimension (since each state already has one) and pad.
             states_list = [s.squeeze(0) for s in trajectory['states']]
             states_batch = pad_sequence(states_list, batch_first=True, padding_value=tokenizer.token_to_id['EoS']).to(device)
 
-            # Run the model on each state.
-            # Note that states_batch now has shape [num_steps, max_state_len].
-            logits, values_new = model(states_batch)
-            # For each state, we only need the output for its last non-padded token.
-            last_indices = torch.tensor([len(s) - 1 for s in states_list], device=device)
-            # Gather logits corresponding to each state's last token.
-            logits_last = logits[torch.arange(len(last_indices)), last_indices, :]
-            values_last = values_new[torch.arange(len(last_indices)), last_indices].unsqueeze(1)
+            # FP16 context for model forward and loss calculation
+            with torch.cuda.amp.autocast():
+                logits, values_new = model(states_batch)
+                last_indices = torch.tensor([len(s) - 1 for s in states_list], device=device)
+                logits_last = logits[torch.arange(len(last_indices)), last_indices, :]
+                values_last = values_new[torch.arange(len(last_indices)), last_indices].unsqueeze(1)
 
-            # Now compute new log probabilities for the stored actions.
-            dist = Categorical(F.softmax(logits_last, dim=-1))
-            new_log_probs = dist.log_prob(trajectory['actions'])
+                dist = Categorical(F.softmax(logits_last, dim=-1, dtype=torch.float32)) # Ensure softmax in FP32
+                new_log_probs = dist.log_prob(trajectory['actions'])        
 
-            # Continue with PPO loss computations:
-            ratios = torch.exp(new_log_probs - trajectory['log_probs'])
-            surr1 = ratios * trajectory['advantages']
-            surr2 = torch.clamp(ratios, 1-clip_param, 1+clip_param) * trajectory['advantages']
-            policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = F.mse_loss(values_last, trajectory['returns'])
-            entropy = dist.entropy().mean()
+                ratios = torch.exp(new_log_probs - trajectory['log_probs'])
+                surr1 = ratios * trajectory['advantages']
+                surr2 = torch.clamp(ratios, 1-clip_param, 1+clip_param) * trajectory['advantages']
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss = F.mse_loss(values_last, trajectory['returns'])
+                entropy = dist.entropy().mean()
+                moe_loss = sum(module.auxiliary_loss() for module in model.modules() if isinstance(module, DYNMOELayer))
+                total_loss = (policy_loss
+                            + value_loss_coef * value_loss
+                            - entropy_coef * entropy
+                            + moe_aux_loss_coef * moe_loss)
 
-            # Add any additional auxiliary losses (e.g., from MOE) as before
-            moe_loss = sum(module.auxiliary_loss() for module in model.modules() if isinstance(module, DYNMOELayer))
-            total_loss = (policy_loss
-                          + value_loss_coef * value_loss
-                          - entropy_coef * entropy
-                          + moe_aux_loss_coef * moe_loss)
-            total_loss.backward()
-            optimizer.step()
+            # Scale loss and perform optimization step
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-    return avg_reward   
+    return avg_reward
+
+
 
 def evaluate_model(model, difficulty_level, num_samples=100):
     model.eval()
@@ -678,6 +591,8 @@ model = RecallTransformerWithMoE(
 ).to(device)
 
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+scaler = torch.cuda.amp.GradScaler() # Initialize GradScaler here
+
 
 num_iterations = 500
 current_difficulty = initial_difficulty
@@ -689,7 +604,7 @@ for iteration in range(num_iterations):
     
     # Run PPO iteration
     avg_reward = ppo_iteration(
-        model, optimizer, ppo_epochs, batch_size_ppo, 
+        model, optimizer, scaler, ppo_epochs, batch_size_ppo, # Pass scaler here
         dataset_rl, tokenizer, vocab
     )
     
