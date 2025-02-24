@@ -196,35 +196,36 @@ class RCTNetIPT(nn.Module):
 #############################################
 # 5. ENHANCED TRAINING LOOP
 #############################################
-def evaluate_model(model, dataloader, m_iterations, device, print_examples=False, num_examples_to_print=2): # added print_examples and num_examples_to_print
-    model.eval()
-    correct_predictions = 0
-    total_predictions = 0
-    example_count = 0 # Counter for printed examples
-    max_examples = num_examples_to_print # Maximum number of examples to print, now configurable
-    with torch.no_grad():
-        for input_ids, targets in dataloader:
-            input_ids, targets = input_ids.to(device), targets.to(device)
-            logits = model(input_ids, m_iterations)
-            predictions = torch.argmax(F.softmax(logits, dim=-1), dim=-1)
-            correct_predictions += (predictions == targets).sum().item()
-            total_predictions += targets.size(0)
-            if print_examples and example_count < max_examples: # Print example predictions only if print_examples is True
-                for i in range(input_ids.size(0)): # Iterate through batch examples
-                    input_seq = input_ids[i].tolist()
-                    target_token = targets[i].item()
-                    predicted_token = predictions[i].item()
-                    input_expr = decode_input(input_seq) # Decode input, remove padding in decode_input
-                    predicted_output = decode_output([predicted_token])
-                    target_output = decode_output([target_token])
-                    print(f"  Input: '{input_expr}'") # Indented example prints
-                    print(f"  Predicted: '{predicted_output}', Target: '{target_output}'") # Indented example prints
-                    example_count += 1
-                    if example_count >= max_examples: # Stop printing after max examples
-                        break
-                if example_count >= max_examples:
-                    break # Break outer loop as well if max examples reached
-    return correct_predictions / total_predictions
+def evaluate_model(model, dataloader, m_iterations, device, print_examples=False, num_examples_to_print=2):
+   model.eval()
+   correct_predictions = 0
+   total_predictions = 0
+   example_count = 0  # Counter for printed examples
+   max_examples = num_examples_to_print  # Maximum number of examples to print, now configurable
+   with torch.no_grad():
+       for input_ids, targets in dataloader:
+           input_ids, targets = input_ids.to(device), targets.to(device)
+           logits = model(input_ids, m_iterations)
+           predictions = torch.argmax(F.softmax(logits, dim=-1), dim=-1)
+           correct_predictions += (predictions == targets).sum().item()
+           total_predictions += targets.size(0)
+           if print_examples:  # Only execute if print_examples is True
+               from random import sample  # Import inside the conditional block
+               num_examples = min(input_ids.size(0), num_examples_to_print) # Don't request more examples than exist.
+               indices_to_print = sample(range(input_ids.size(0)), num_examples)
+               for i in indices_to_print:
+                   if example_count < max_examples :  # Ensure total printed examples don't exceed the limit
+                       input_seq = input_ids[i].tolist()
+                       target_token = targets[i].item()
+                       predicted_token = predictions[i].item()
+                       input_expr = decode_input(input_seq)  # Decode input, remove padding in decode_input
+                       predicted_output = decode_output([predicted_token])
+                       target_output = decode_output([target_token])
+                       print(f"  Input: '{input_expr}'")  # Indented example prints
+                       print(f"  Predicted: '{predicted_output}', Target: '{target_output}'")  # Indented example prints
+                       example_count += 1
+                       # No break statement is needed here; the outer example_count limit already controls the number of iterations
+   return correct_predictions / total_predictions
 def train_curriculum(model, device, base_num_epochs=3, base_num_samples=1000,
                     m_iterations=8, alpha=0.5, max_difficulty=4, batch_size=32, print_batch_loss_every=100, stabilization_patience=2): # added print_batch_loss_every and stabilization_patience
     def get_dynamic_threshold(current_diff):
