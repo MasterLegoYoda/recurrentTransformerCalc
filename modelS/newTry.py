@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 from transformers import get_linear_schedule_with_warmup
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 #############################################
 # 1. ARITHMETIC EXPRESSION GENERATOR
 #############################################
@@ -226,15 +227,19 @@ def evaluate_model(model, dataloader, m_iterations, device, print_examples=False
                        example_count += 1
                        # No break statement is needed here; the outer example_count limit already controls the number of iterations
    return correct_predictions / total_predictions
-def train_curriculum(model, device, base_num_epochs=3, base_num_samples=1000,
-                    m_iterations=8, alpha=0.5, max_difficulty=4, batch_size=32, print_batch_loss_every=100, stabilization_patience=2): # added print_batch_loss_every and stabilization_patience
+def train_curriculum(model, device, base_num_epochs=6, base_num_samples=1000,
+                    m_iterations=8, alpha=0.5, max_difficulty=4, batch_size=32, print_batch_loss_every=100, stabilization_patience=4): # added print_batch_loss_every and stabilization_patience
     def get_dynamic_threshold(current_diff):
-        return min(0.85 + 0.05 * current_diff, 0.95)
-    optimizer = AdamW(model.parameters(), lr=3e-5, weight_decay=0.01)
+        return min(0.9 + 0.05 * current_diff, 0.98)
+    optimizer = AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1)
     current_difficulty = 1
     total_steps = base_num_epochs * (max_difficulty * base_num_samples // batch_size)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=1000, num_training_steps=total_steps)
+    scheduler = ReduceLROnPlateau(optimizer,
+                                mode='max',  # Monitor validation accuracy (maximize)
+                                factor=0.5,  # Reduce LR by half when plateau occurs
+                                patience=2,  # Wait 2 epochs of no improvement
+                                verbose=True) # Print messages when LR is reduced
     success_count = 0 # Counter for consecutive successful validations
     while current_difficulty <= max_difficulty:
         threshold = get_dynamic_threshold(current_difficulty)
@@ -252,7 +257,7 @@ def train_curriculum(model, device, base_num_epochs=3, base_num_samples=1000,
                 loss.backward()
                 #torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-                scheduler.step()
+                #scheduler.step()
                 epoch_loss += loss.item()
                 if batch_idx % print_batch_loss_every == 0: # Reduced batch loss printing frequency
                     print(f"  Epoch {epoch+1}/{base_num_epochs} Batch {batch_idx} Loss: {loss.item():.4f}") # Indented batch loss print
@@ -263,6 +268,7 @@ def train_curriculum(model, device, base_num_epochs=3, base_num_samples=1000,
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=ArithmeticDataset.collate_fn)
             acc = evaluate_model(model, val_loader, m_iterations, device, print_examples=True, num_examples_to_print=1) # Reduced example prints in validation
             print(f"  Validation accuracy: {acc*100:.2f}%") # Indented validation accuracy print
+            scheduler.step(acc)
             if acc >= threshold:
                 success_count += 1
                 print(f"  Threshold reached, success count: {success_count}/{stabilization_patience}") # Indicate success count
@@ -285,7 +291,7 @@ if __name__ == "__main__":
     config = {
         "N_initial": 3,
         "D_initial": 512,
-        "L_recurrent": 4,
+        "L_recurrent": 8,
         "D_recurrent": 768,
         "H_layers": 2, # H_layers is not used, removed from prints.
         "D_halt": 256,
@@ -298,4 +304,4 @@ if __name__ == "__main__":
         "output_dim": len(OUTPUT_TOKENS),
     }
     model = RCTNetIPT(config).to(device)
-    train_curriculum(model, device, print_batch_loss_every=200, stabilization_patience=3) # Example of changing batch loss print frequency and setting stabilization patience
+    train_curriculum(model, device, print_batch_loss_every=200, stabilization_patience=5) # Example of changing batch loss print frequency and setting stabilization patience
